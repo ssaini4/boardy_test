@@ -1,0 +1,17 @@
+FROM python:3.10.7
+
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
+
+RUN apt-get update && apt-get install -y \
+    && python -m pip install --upgrade pip setuptools \
+    && mkdir -p /workspace/boardy_test
+
+WORKDIR /workspace/boardy_test
+
+COPY ./requirements.txt /workspace/boardy_test/requirements.txt
+
+RUN pip install -r ./requirements.txt \
+    && apt-get clean
+
+COPY . /workspace/boardy_test/
