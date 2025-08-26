@@ -5,6 +5,7 @@ from typing import Any, Optional, Set, Dict
 from redis import Redis
 import pickle
 import numpy as np
+from difflib import SequenceMatcher
 from redis.commands.search.field import TextField, VectorField
 from redis.commands.search.index_definition import IndexDefinition, IndexType
 from redis.commands.search.query import Query
@@ -13,13 +14,24 @@ import logging
 import threading
 from dataclasses import dataclass, asdict
 
-SIMILARITY_THRESHOLD = 0.55
+SIMILARITY_THRESHOLD = 0.65
 MIN_RESULTS = 10
 # Rerank / entity-check hyperparams
 RERANK_TOP_K = 50  # number of neighbors to fetch for rerank (<= index K)
 RERANK_ALPHA = 0.85  # weight for exact cosine
 ENTITY_WEIGHT = 1.0 - RERANK_ALPHA  # weight for entity match
 ENTITY_MATCH_THRESHOLD = 0.0  # if any overlap -> entity_score = 1.0, else 0.0
+
+# Enhanced entity matching parameters
+ENTITY_TYPE_WEIGHTS = {
+    "PERSON": 1.2,  # People names are quite important
+    "ORG": 1.1,  # Organizations are important
+    "GPE": 1.0,  # Geopolitical entities (countries, cities)
+    "LOC": 0.9,  # Locations
+    "DEFAULT": 1.0,  # Fallback weight
+}
+FUZZY_MATCH_THRESHOLD = 0.8  # Minimum similarity for fuzzy entity matching
+ENTITY_FREQUENCY_DISCOUNT = 0.1  # Discount factor for very common entities
 
 
 logger = logging.getLogger(__name__)
@@ -136,6 +148,7 @@ class LRUCache:
         self.redis = Redis(host=redis_host, port=redis_port, db=redis_db, decode_responses=False)
         self.cache_prefix = cache_prefix
         self.lru_list_key = f"{cache_prefix}:lru_order"
+        self.entity_freq_key = f"{cache_prefix}:entity_freq"  # For tracking entity frequencies
         self.cache_type = cache_type
 
         # Initialize metrics tracking
@@ -336,6 +349,166 @@ class LRUCache:
         ents = {w.strip().lower() for w in words if w not in stop}
         return ents
 
+    def _extract_entities_with_types(self, text: str) -> Dict[str, str]:
+        """Extract entities with their types. Returns {entity_text: entity_type}."""
+        if not text:
+            return {}
+
+        entity_dict = {}
+
+        # Try spaCy NER if we have it
+        if self._nlp:
+            try:
+                doc = self._nlp(text)
+                for ent in doc.ents:
+                    if ent.label_ in ("PERSON", "GPE", "LOC", "ORG"):
+                        entity_dict[ent.text.strip().lower()] = ent.label_
+                if entity_dict:
+                    return entity_dict
+            except Exception:
+                # fallthrough to heuristic
+                pass
+
+        # Simple heuristic: all get DEFAULT type
+        words = re.findall(r"\b[A-Z][a-zA-Z0-9\-']+\b", text)
+        stop = {"Who", "What", "When", "Where", "Why", "How", "First", "Last", "The", "A", "An"}
+        for word in words:
+            if word not in stop:
+                entity_dict[word.strip().lower()] = "DEFAULT"
+
+        return entity_dict
+
+    def _fuzzy_entity_match(self, entity1: str, entity2: str) -> float:
+        """Calculate fuzzy similarity between two entity strings."""
+        return SequenceMatcher(None, entity1.lower(), entity2.lower()).ratio()
+
+    def _calculate_entity_overlap_score(
+        self, query_entities: Dict[str, str], cand_entities: Dict[str, str]
+    ) -> float:
+        """Calculate sophisticated entity overlap score considering types, fuzzy matching, and weights."""
+        if not query_entities and not cand_entities:
+            return 0.0  # Neither has entities, neutral score
+
+        if not query_entities or not cand_entities:
+            return 0.0  # One has entities, other doesn't - no match
+
+        total_score = 0.0
+        max_possible_score = 0.0
+
+        # Check each query entity against all candidate entities
+        for q_entity, q_type in query_entities.items():
+            q_weight = ENTITY_TYPE_WEIGHTS.get(q_type, ENTITY_TYPE_WEIGHTS["DEFAULT"])
+            max_possible_score += q_weight
+
+            best_match_score = 0.0
+
+            # Look for exact and fuzzy matches
+            for c_entity, c_type in cand_entities.items():
+                if q_entity == c_entity:
+                    # Exact match - full score with type weighting
+                    c_weight = ENTITY_TYPE_WEIGHTS.get(c_type, ENTITY_TYPE_WEIGHTS["DEFAULT"])
+                    match_score = (q_weight + c_weight) / 2.0  # Average the weights
+                    best_match_score = max(best_match_score, match_score)
+                else:
+                    # Try fuzzy match
+                    fuzzy_sim = self._fuzzy_entity_match(q_entity, c_entity)
+                    if fuzzy_sim >= FUZZY_MATCH_THRESHOLD:
+                        c_weight = ENTITY_TYPE_WEIGHTS.get(c_type, ENTITY_TYPE_WEIGHTS["DEFAULT"])
+                        # Scale by fuzzy similarity
+                        match_score = fuzzy_sim * (q_weight + c_weight) / 2.0
+                        best_match_score = max(best_match_score, match_score)
+
+            total_score += best_match_score
+
+        # Normalize by the maximum possible score
+        if max_possible_score > 0:
+            return min(1.0, total_score / max_possible_score)
+
+        return 0.0
+
+    def _update_entity_frequencies(self, entities: Dict[str, str]):
+        """Update entity frequency counts in Redis."""
+        if not entities or self.cache_type != CacheType.SEMANTIC:
+            return
+
+        try:
+            # Increment frequency count for each entity
+            for entity_text in entities.keys():
+                self.redis.hincrby(self.entity_freq_key, entity_text, 1)
+        except Exception as e:
+            logger.warning(f"Failed to update entity frequencies: {e}")
+
+    def _get_entity_frequency(self, entity: str) -> int:
+        """Get the frequency count for an entity."""
+        try:
+            freq_bytes = self.redis.hget(self.entity_freq_key, entity)
+            if freq_bytes is None:
+                return 0
+            return int(freq_bytes.decode("utf-8") if isinstance(freq_bytes, bytes) else freq_bytes)
+        except Exception:
+            return 0
+
+    def _calculate_entity_rarity_weight(self, entity: str) -> float:
+        """Calculate rarity weight for an entity. Rarer entities get higher weights."""
+        frequency = self._get_entity_frequency(entity)
+        if frequency == 0:
+            return 1.0  # New entity, maximum weight
+
+        # Apply logarithmic scaling to reduce impact of very frequent entities
+        # Higher frequency -> lower weight
+        rarity_weight = 1.0 / (1.0 + np.log(1 + frequency))
+        return max(0.1, rarity_weight)  # Minimum weight to prevent complete discount
+
+    def _calculate_entity_overlap_score_with_frequency(
+        self, query_entities: Dict[str, str], cand_entities: Dict[str, str]
+    ) -> float:
+        """Calculate entity overlap score with frequency-based weighting."""
+        if not query_entities and not cand_entities:
+            return 0.0  # Neither has entities, neutral score
+
+        if not query_entities or not cand_entities:
+            return 0.0  # One has entities, other doesn't - no match
+
+        total_score = 0.0
+        max_possible_score = 0.0
+
+        # Check each query entity against all candidate entities
+        for q_entity, q_type in query_entities.items():
+            q_weight = ENTITY_TYPE_WEIGHTS.get(q_type, ENTITY_TYPE_WEIGHTS["DEFAULT"])
+            q_rarity = self._calculate_entity_rarity_weight(q_entity)
+            q_final_weight = q_weight * q_rarity
+            max_possible_score += q_final_weight
+
+            best_match_score = 0.0
+
+            # Look for exact and fuzzy matches
+            for c_entity, c_type in cand_entities.items():
+                if q_entity == c_entity:
+                    # Exact match - full score with type and rarity weighting
+                    c_weight = ENTITY_TYPE_WEIGHTS.get(c_type, ENTITY_TYPE_WEIGHTS["DEFAULT"])
+                    c_rarity = self._calculate_entity_rarity_weight(c_entity)
+                    c_final_weight = c_weight * c_rarity
+                    match_score = (q_final_weight + c_final_weight) / 2.0  # Average the weights
+                    best_match_score = max(best_match_score, match_score)
+                else:
+                    # Try fuzzy match
+                    fuzzy_sim = self._fuzzy_entity_match(q_entity, c_entity)
+                    if fuzzy_sim >= FUZZY_MATCH_THRESHOLD:
+                        c_weight = ENTITY_TYPE_WEIGHTS.get(c_type, ENTITY_TYPE_WEIGHTS["DEFAULT"])
+                        c_rarity = self._calculate_entity_rarity_weight(c_entity)
+                        c_final_weight = c_weight * c_rarity
+                        # Scale by fuzzy similarity
+                        match_score = fuzzy_sim * (q_final_weight + c_final_weight) / 2.0
+                        best_match_score = max(best_match_score, match_score)
+
+            total_score += best_match_score
+
+        # Normalize by the maximum possible score
+        if max_possible_score > 0:
+            return min(1.0, total_score / max_possible_score)
+
+        return 0.0
+
     # -----------------------------
     # Enhanced get_similar with rerank + entity-check + metrics
     # -----------------------------
@@ -373,8 +546,8 @@ class LRUCache:
             best_candidate = None
             best_combined_score = -1.0
 
-            # Extract query entities once
-            query_entities = self._extract_entities(query)
+            # Extract query entities with types once
+            query_entities = self._extract_entities_with_types(query)
 
             for doc in results.docs:
                 # doc.id is the Redis key for the hash (e.g. "lru_cache:semantic:<key>")
@@ -405,20 +578,16 @@ class LRUCache:
                 except Exception:
                     continue
 
-                # entity extraction and match scoring
+                # enhanced entity extraction and match scoring
                 cand_query_field = getattr(doc, "query", None)
                 if isinstance(cand_query_field, bytes):
                     cand_query_field = cand_query_field.decode("utf-8")
-                cand_entities = self._extract_entities(cand_query_field or "")
+                cand_entities = self._extract_entities_with_types(cand_query_field or "")
 
-                entity_score = 0.0
-                if query_entities and cand_entities and (len(query_entities & cand_entities) > 0):
-                    entity_score = 1.0
-                elif (not query_entities) and (not cand_entities):
-                    # if neither has entities, neutral (0); leave entity_score = 0.0
-                    entity_score = 0.0
-                else:
-                    entity_score = 0.0
+                # calculate sophisticated entity overlap score with frequency weighting
+                entity_score = self._calculate_entity_overlap_score_with_frequency(
+                    query_entities, cand_entities
+                )
 
                 # combine similarity + entity signal
                 combined = (RERANK_ALPHA * sim) + (ENTITY_WEIGHT * entity_score)
@@ -516,7 +685,7 @@ class LRUCache:
             self.redis.set(cache_key, self._serialize(value))
             self.redis.rpush(self.lru_list_key, key)
 
-            # For semantic cache, also store embedding
+            # For semantic cache, also store embedding and update entity frequencies
             if self.cache_type == CacheType.SEMANTIC and self.openai_client:
                 try:
                     embedding = self._get_embedding(key)
@@ -531,6 +700,11 @@ class LRUCache:
 
                     # store in a Redis hash at the semantic key
                     self.redis.hset(self._semantic_key(key), mapping=semantic_data)
+
+                    # Update entity frequencies for the new query
+                    key_entities = self._extract_entities_with_types(key)
+                    self._update_entity_frequencies(key_entities)
+
                 except Exception as e:
                     logger.exception("Error storing semantic data: %s", e)
 
@@ -561,8 +735,10 @@ class LRUCache:
                 if semantic_keys:
                     self.redis.delete(*semantic_keys)
 
-        # Clear the LRU list
+        # Clear the LRU list and entity frequencies
         self.redis.delete(self.lru_list_key)
+        if self.cache_type == CacheType.SEMANTIC:
+            self.redis.delete(self.entity_freq_key)
 
     def size(self) -> int:
         """Get current cache size."""
@@ -583,36 +759,38 @@ class LRUCache:
     def print_metrics(self):
         """Print formatted metrics to console"""
         metrics = self.get_metrics_dict()
-
-        print(f"\n{'='*60}")
-        print(f"CACHE PERFORMANCE METRICS - {self.cache_type.value.upper()}")
-        print(f"{'='*60}")
-        print(f"Uptime: {metrics['uptime_minutes']:.1f} minutes")
-        print(f"")
-        print(f"OPERATIONS:")
-        print(f"  GET operations: {metrics['get_operations']}")
-        print(f"  HAS operations: {metrics['has_operations']}")
-        print(f"  SET operations: {metrics['set_operations']}")
+        text = ""
+        text += f"\n{'='*60}\n"
+        text += f"CACHE PERFORMANCE METRICS - {self.cache_type.value.upper()}\n"
+        text += f"{'='*60}\n"
+        text += f"Uptime: {metrics['uptime_minutes']:.1f} minutes\n"
+        text += f"\n"
+        text += f"OPERATIONS:\n"
+        text += f"  GET operations: {metrics['get_operations']}\n"
+        text += f"  HAS operations: {metrics['has_operations']}\n"
+        text += f"  SET operations: {metrics['set_operations']}\n"
         if self.cache_type == CacheType.SEMANTIC:
-            print(f"  SEMANTIC operations: {metrics['semantic_operations']}")
-        print(f"  Operations/sec: {metrics['operations_per_second']:.2f}")
-        print(f"")
-        print(f"HIT/MISS STATS:")
-        print(f"  Hits: {metrics['hits']}")
-        print(f"  Misses: {metrics['misses']}")
-        print(f"  Hit Rate: {metrics['hit_rate']:.1f}%")
+            text += f"  SEMANTIC operations: {metrics['semantic_operations']}\n"
+        text += f"  Operations/sec: {metrics['operations_per_second']:.2f}\n"
+        text += f"\n"
+        text += f"HIT/MISS STATS:\n"
+        text += f"  Hits: {metrics['hits']}\n"
+        text += f"  Misses: {metrics['misses']}\n"
+        text += f"  Hit Rate: {metrics['hit_rate']:.1f}%\n"
         if self.cache_type == CacheType.SEMANTIC:
-            print(f"  Semantic Hits: {metrics['semantic_hits']}")
-            print(f"  Semantic Misses: {metrics['semantic_misses']}")
-            print(f"  Semantic Hit Rate: {metrics['semantic_hit_rate']:.1f}%")
-        print(f"")
-        print(f"LATENCY STATS:")
-        print(f"  Average: {metrics['avg_latency']:.4f}s")
-        print(f"  Minimum: {metrics['min_latency']:.4f}s")
-        print(f"  Maximum: {metrics['max_latency']:.4f}s")
+            text += f"  Semantic Hits: {metrics['semantic_hits']}\n"
+            text += f"  Semantic Misses: {metrics['semantic_misses']}\n"
+            text += f"  Semantic Hit Rate: {metrics['semantic_hit_rate']:.1f}%\n"
+        text += f"\n"
+        text += f"LATENCY STATS:\n"
+        text += f"  Average: {metrics['avg_latency']:.4f}s\n"
+        text += f"  Minimum: {metrics['min_latency']:.4f}s\n"
+        text += f"  Maximum: {metrics['max_latency']:.4f}s\n"
         if self.cache_type == CacheType.SEMANTIC:
-            print(f"  Semantic Avg: {metrics['semantic_avg_latency']:.4f}s")
-        print(f"{'='*60}")
+            text += f"  Semantic Avg: {metrics['semantic_avg_latency']:.4f}s\n"
+        text += f"{'='*60}\n"
+        print(text)
+        return text
 
     def reset_metrics(self):
         """Reset all metrics counters"""

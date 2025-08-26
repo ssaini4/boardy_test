@@ -72,7 +72,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Chatbot API",
+    title="Boardy Test API",
     description="A FastAPI chatbot with text embedding and LLM integration",
     lifespan=lifespan,
 )
@@ -97,9 +97,13 @@ async def health_check():
 @app.get("/print_metrics")
 async def print_metrics():
     """Print metrics endpoint"""
-    text_cache.print_metrics()
-    semantic_cache.print_metrics()
-    return {"message": "Metrics printed successfully"}
+    text_metrics = text_cache.print_metrics()
+    semantic_metrics = semantic_cache.print_metrics()
+    return {
+        "message": "Metrics printed successfully",
+        "text_metrics": text_metrics,
+        "semantic_metrics": semantic_metrics,
+    }
 
 
 @app.get("/metrics")
