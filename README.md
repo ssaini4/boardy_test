@@ -12,6 +12,8 @@ A FastAPI server that functions as a chatbot with text embedding capabilities. U
 - 🐳 **Docker Ready**: Includes Docker configuration
 
 
+## DEMO Video: https://youtu.be/t1e848-j1Wo
+
 ## Getting Started
 
 ### Prerequisites
