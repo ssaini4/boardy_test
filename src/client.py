@@ -183,7 +183,14 @@ Embedding: {result['embedding'][:5]}... (showing first 5 values)
 
                     # Display the response
                     console.print("\n[bold green]Assistant[/bold green]:")
-                    console.print(Panel(Markdown(response_text), style="green"))
+                    console.print(
+                        Panel(Markdown(response_text), style="green"),
+                        Panel(
+                            Markdown(result.get("metadata", "No metadata")["source"]),
+                            title="Source",
+                            style="dim",
+                        ),
+                    )
 
                     # If embedding is included, show some info
                     if "embedding" in result and result["embedding"]:
@@ -227,7 +234,12 @@ def chat(
                         Panel(
                             Markdown(result.get("response", "No response")),
                             style="green",
-                        )
+                        ),
+                        # Panel(
+                        #     Markdown(result.get("metadata", "No metadata")["source"]),
+                        #     title="Source",
+                        #     style="pink",
+                        # ),
                     )
                 else:
                     console.print(f"Error: {result.get('error', 'Unknown error')}", style="red")

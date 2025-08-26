@@ -1,4 +1,5 @@
 from enum import Enum
+import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import openai
@@ -34,7 +35,7 @@ class Metadata(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    force_refresh: bool = False
+    forceRefresh: bool = False
 
 
 class ChatResponse(BaseModel):
@@ -93,12 +94,22 @@ async def health_check():
     return status
 
 
+@app.get("/print_metrics")
+async def print_metrics():
+    """Print metrics endpoint"""
+    text_cache.print_metrics()
+    semantic_cache.print_metrics()
+    return {"message": "Metrics printed successfully"}
+
+
 @app.get("/metrics")
 async def metrics():
     """Metrics endpoint"""
-    text_cache.print_metrics()
-    semantic_cache.print_metrics()
-    return True
+    text_metrics = text_cache.get_metrics_dict()
+    semantic_metrics = semantic_cache.get_metrics_dict()
+    return json.dumps(
+        {"text_cache": text_metrics, "semantic_cache": semantic_metrics}, allow_nan=True
+    )
 
 
 @app.post("/api/query")
@@ -112,7 +123,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     try:
 
-        if not request.force_refresh and not check_time_sensitive(request.message):
+        if not request.forceRefresh and not check_time_sensitive(request.message):
             ## Check if exact text query is in cache
             if text_cache.has(request.message):
                 cached_response = text_cache.get(request.message)
@@ -143,7 +154,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         semantic_cache.set(request.message, llm_response)
         response = {"response": llm_response, "metadata": {"source": "llm"}}
 
-        return response  # Fixed metadata
+        return response
 
     except Exception as e:
         logger.error(f"Error in chat endpoint: {e}")
@@ -153,5 +164,6 @@ async def chat(request: ChatRequest) -> ChatResponse:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
     host = os.getenv("HOST", "0.0.0.0")
+    workers = int(os.getenv("WORKERS", 4))
 
-    uvicorn.run("main:app", host=host, port=port, reload=True, log_level="info")
+    uvicorn.run("main:app", host=host, port=port, reload=True, log_level="info", workers=workers)

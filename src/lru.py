@@ -13,7 +13,7 @@ import logging
 import threading
 from dataclasses import dataclass, asdict
 
-SIMILARITY_THRESHOLD = 0.25
+SIMILARITY_THRESHOLD = 0.55
 MIN_RESULTS = 10
 # Rerank / entity-check hyperparams
 RERANK_TOP_K = 50  # number of neighbors to fetch for rerank (<= index K)
