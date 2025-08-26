@@ -141,29 +141,33 @@ You: Hello! Can you help me understand machine learning?
 🤔 Thinking...
 ```
 
-## Architecture Overview
+## Overall Architecture
 
-### Overall Architecture
-The application relies on a FastAPI server with a Redis cache that server as a Least Recently Used (LRU) cache to store the incoming queries and data generated to process queries.
+The application is built on a FastAPI server with a Redis LRU cache, which stores incoming queries and generated responses. This setup improves performance by reducing redundant calls to the LLM and ensures frequently accessed results are served quickly.
 
-### FastAPI server
-FastAPI is a widely used backend framework with flexibility to horizontally scale the endpoints and applications as required. FastAPI also provides Swagger APIs out of the box so developers get the benefit of documentation.
-We are using uvicorn servers with worker configuration which makes it easy to scale the number of workers based on our infrastructure. 
+### FastAPI Server
 
-### LRU Cache
+FastAPI is a modern, high-performance backend framework that supports horizontal scaling of endpoints and applications. It also provides Swagger documentation out-of-the-box, making API exploration easier for developers.
+We run FastAPI with Uvicorn and a configurable number of workers, allowing the service to scale efficiently with infrastructure capacity.
 
-Redis is the Swiss army knife of backend development. For this application, we are using Redis in two-configurations - text cache and semantic cache.
+### LRU Cache with Redis
 
-For this application, we are using the LRU configuration and store the most recent 1000 items. This can be easily increase and scaled to accomodate for higher traffic and data.
+Redis is often called the Swiss army knife of backend development. In this application, it serves as both a text cache and a semantic cache, configured with LRU eviction. Currently, we store the most recent 1,000 items, but this can be easily increased to handle higher traffic.
 
 #### Text Cache
 
-Simple query message <> response cache to store most recent N queries. If there is a duplicate query received, the server simply returns the cached response.
-
+A lightweight cache that stores recent query–response pairs. If a duplicate query arrives, the server immediately returns the cached response.
 
 #### Semantic Cache
 
-Float32 cache which stores the query message, response, embedding and timestamp. 
+A more advanced cache that stores:
+
+- Query text
+- Response
+- Embeddings (Float32 vectors)
+- Timestamps
+
+This enables semantic matching for queries that are not exact duplicates but are contextually similar.
 
 ### Request Flow
 
